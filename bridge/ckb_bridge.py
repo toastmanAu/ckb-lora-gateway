@@ -41,6 +41,15 @@ LOG = os.path.expanduser("~/ckb-lora-bridge/ckb_bridge.log")
 
 CKB_RPC = os.environ.get("CKB_RPC", "https://testnet.ckb.dev")
 
+# Downlink repeats. The T-Deck is half-duplex: after it TXes a request it needs
+# a few ms to retune to the 923.3 MHz downlink band and arm RX, so a single
+# immediate downlink can miss the RX window entirely. Repeating the SAME frame
+# a few times costs ~100 ms on air and makes the reply reliably land. The deck
+# matches on req_id and ignores duplicates, and we pause between requests so
+# the next uplink doesn't collide with a stale repeat.
+DL_REPEAT = int(os.environ.get("DL_REPEAT", "3"))
+DL_REPEAT_GAP = float(os.environ.get("DL_REPEAT_GAP", "0.12"))
+
 MAGIC = 0xCB
 TYPE_REQUEST = 0x02
 TYPE_RESPONSE = 0x03
@@ -137,11 +146,17 @@ def parse_lock_body(req_id, op, body):
 # ── frame helpers ─────────────────────────────────────────────────────────────
 def send_response(req_id, status, body=b""):
     frame = bytes([MAGIC, TYPE_RESPONSE, req_id & 0xFF, status & 0xFF]) + body
-    dl = gwtx.build_downlink_frame(frame, DL_FREQ, DL_SF, DL_BW, 1, 8, DL_POWER,
-                                   int(time.time()) & 0xFFFFFFFF)
-    gwtx.publish_raw(dl)
+    n = max(1, DL_REPEAT)
+    for i in range(n):
+        dl = gwtx.build_downlink_frame(frame, DL_FREQ, DL_SF, DL_BW, 1, 8, DL_POWER,
+                                       int(time.time() * 1000 + i) & 0xFFFFFFFF)
+        gwtx.publish_raw(dl)
+        if i + 1 < n:
+            time.sleep(DL_REPEAT_GAP)
+    # let the concentrator finish the burst before its own next uplink RX
+    time.sleep(0.20)
     log(f"-> resp req={req_id} status={status} body={body.hex()} "
-        f"({len(frame)}B frame, {len(dl)}B downlink)")
+        f"({len(frame)}B frame x{n} downlinks)")
 
 
 def handle(req_id, op, body):
