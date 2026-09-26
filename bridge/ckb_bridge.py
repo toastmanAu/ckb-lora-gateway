@@ -34,6 +34,8 @@ import urllib.request
 import paho.mqtt.client as mqtt
 
 import gwtx  # reuse the DownlinkFrame protobuf builder + topics
+import cemp_stream_rx  # CEMP-LoRa P6 reliable stream receiver
+import cemp_ops       # P7 CEMP application operations
 import phase2_handlers as P2
 
 BROKER = "localhost"
@@ -53,6 +55,16 @@ OP_TIP = 0x03
 OP_SEND_REQ = 0x04
 OP_WITNESS = 0x05
 OP_CELLS = 0x06
+OP_STREAM = 0x07   # CEMP-LoRa reliable stream transport (P6)
+OP_STREAM_POLL = 0x08   # device asks gateway to flush pending ACKs
+# P7 CEMP application ops (0x10..0x16) handled by cemp_ops.CempOps
+OP_CEMP_HELLO = 0x10
+OP_CEMP_PROFILE_GET = 0x11
+OP_CEMP_DISCOVER = 0x12
+OP_CEMP_CELL_GET = 0x13
+OP_CEMP_RESOLVE_INPUTS = 0x14
+OP_CEMP_TX_SUBMIT = 0x15
+OP_CEMP_TX_STATUS = 0x16
 
 # default (SECP256K1_BLAKE160) lock, same code hash on testnet & mainnet
 SECP_CODE_HASH = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8"
@@ -148,6 +160,33 @@ def send_response(req_id, status, body=b""):
         f"({len(frame)}B frame, {len(dl)}B downlink)")
 
 
+def send_stream_downlink(frame_bytes):
+    """Send a raw cemp_stream frame (ACK/CLOSE) to the device on the downlink band.
+    Uses SF7 to match the T-Deck RX config (the legacy response path is SF9)."""
+    dl = gwtx.build_downlink_frame(frame_bytes, DL_FREQ, 7, DL_BW, 1, 8, DL_POWER,
+                                   int(time.time()) & 0xFFFFFFFF)
+    gwtx.publish_raw(dl)
+    log(f"-> stream downlink {frame_bytes.hex()} ({len(frame_bytes)}B)")
+
+
+STREAM_RX = cemp_stream_rx.StreamReceiver(log=log, send_downlink=send_stream_downlink)
+
+# P7: CEMP application ops. Large answers reuse the P6 stream channel so a
+# cell / input set is never truncated by the legacy single-frame response.
+def send_cemp_stream(payload_bytes):
+    import cemp_stream_rx as _csr
+    # Reuse the reliable stream sender: build OPEN + DATA frames and push
+    # them through the stream downlink path.
+    sid = int(time.time()) & 0x7FFFFFFF
+    frames = _csr.encode_stream(sid, 0x06, bytes(payload_bytes), 64)[0]
+    for f in frames:
+        send_stream_downlink(f)
+    log(f'-> cemp stream {len(payload_bytes)}B as {len(frames)} frame(s) sid={sid}')
+
+CEMP_OPS = cemp_ops.CempOps()
+CEMP_OPS.wire(rpc=rpc, send_response=send_response, log=log, send_stream=send_cemp_stream)
+
+
 def handle(req_id, op, body):
     if op == OP_PING:
         log(f"PING req={req_id}")
@@ -186,6 +225,18 @@ def handle(req_id, op, body):
 
     elif op == OP_WITNESS:
         P2.handle_witness(req_id, body)
+
+    elif op == OP_STREAM:
+        status = STREAM_RX.handle(body)
+        log(f"STREAM req={req_id} -> {status}")
+
+    elif op == OP_STREAM_POLL:
+        n = STREAM_RX.flush_pending()
+        log(f"STREAM_POLL req={req_id} -> flushed {n} frame(s)")
+
+    elif OP_CEMP_HELLO <= op <= OP_CEMP_TX_STATUS:
+        status = CEMP_OPS.handle(req_id, op, body)
+        log(f"CEMP req={req_id} op=0x{op:02x} -> {status}")
 
     else:
         log(f"unknown op 0x{op:02x} req={req_id}")
