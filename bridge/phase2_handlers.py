@@ -16,13 +16,44 @@ rpc = None
 send_response = None
 log = None
 
-
-def wire(_rpc, _send_response, _log):
-    global rpc, send_response, log
-    rpc, send_response, log = _rpc, _send_response, _log
-
 PENDING = {}            # req_id -> dict
 FEE_SHANNONS = 100000   # 0.001 CKB flat fee (testnet)
+PENDING_TTL_S = 120     # drop built-but-unsigned txs so the map cannot leak
+
+# Response redundancy: the device has no downlink retry, so one lost packet
+# stalls the whole handshake (observed at 2.5 km). ckb_bridge injects a
+# scheduler at wire() time so repeats do not block the MQTT loop.
+_scheduler = None       # (delay_s, fn) -> None
+
+
+def wire(_rpc, _send_response, _log, _schedule=None):
+    global rpc, send_response, log, _scheduler
+    rpc, send_response, log = _rpc, _send_response, _log
+    if _schedule is not None:
+        _scheduler = _schedule
+
+
+def sweep_pending():
+    """Drop stale pending sends (device never came back with a WITNESS).
+    Without this, a hung/lost handshake leaks the built tx forever."""
+    now = time.time()
+    for rid in [r for r, p in PENDING.items() if now - p.get("ts", now) > PENDING_TTL_S]:
+        PENDING.pop(rid, None)
+        log(f"SEND_REQ req={rid} expired (no WITNESS within {PENDING_TTL_S}s)")
+
+
+def respond_redundant(req_id, status, body=b"", repeats=3, gap_s=0.6):
+    """Send a downlink response more than once.
+
+    Cheap and idempotent: the device keys its state by req id, so duplicate
+    responses are harmless and absorbed. Repeats are scheduled, never slept on,
+    so the MQTT loop keeps servicing other traffic.
+    """
+    send_response(req_id, status, body)
+    for i in range(1, repeats):
+        if _scheduler is None:
+            return
+        _scheduler(i * gap_s, lambda r=req_id, s=status, b=body: send_response(r, s, b))
 
 SECP_CODE_HASH_B = bytes.fromhex(
     "9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8")
@@ -120,7 +151,7 @@ def handle_send_req(req_id, body):
     }
     log(f"SEND_REQ req={req_id} in={len(picked)} out={len(rpc_outputs)} "
         f"amount={amount} change={change} sighash={sighash.hex()}")
-    send_response(req_id, 0, sighash)
+    respond_redundant(req_id, 0, sighash)
 
 
 def handle_witness(req_id, body):
@@ -139,9 +170,19 @@ def handle_witness(req_id, body):
     try:
         txh = rpc("send_transaction", [tx])
     except Exception as e:  # noqa: BLE001
+        # The device retransmits WITNESS if the ack is lost, so the same tx may
+        # already be on-chain. CKB reports that as a duplicate-tx error; treat it
+        # as success so a lost ack does not surface as a failed send.
+        msg = str(e).lower()
+        if "already" in msg or "duplicate" in msg or "known" in msg:
+            txh = pend.get("tx_hash")
+            log(f"WITNESS req={req_id} already broadcast (dup) -> {txh}")
+            PENDING.pop(req_id, None)
+            respond_redundant(req_id, 0, bytes.fromhex(txh[2:]))
+            return
         log(f"WITNESS req={req_id} broadcast FAILED: {e}")
         send_response(req_id, 7)
         return
     PENDING.pop(req_id, None)
     log(f"WITNESS req={req_id} broadcast -> {txh}")
-    send_response(req_id, 0, bytes.fromhex(txh[2:]))
+    respond_redundant(req_id, 0, bytes.fromhex(txh[2:]))

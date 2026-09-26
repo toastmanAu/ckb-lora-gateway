@@ -27,12 +27,14 @@ Run: ~/ckb-lora-bridge/venv/bin/python ~/ckb-lora-bridge/ckb_bridge.py
 import json
 import os
 import struct
+import threading
 import time
 import urllib.request
 
 import paho.mqtt.client as mqtt
 
 import gwtx  # reuse the DownlinkFrame protobuf builder + topics
+import phase2_handlers as P2
 
 BROKER = "localhost"
 PORT = 1883
@@ -40,15 +42,6 @@ SUB_TOPIC = "ckblora/decoded"
 LOG = os.path.expanduser("~/ckb-lora-bridge/ckb_bridge.log")
 
 CKB_RPC = os.environ.get("CKB_RPC", "https://testnet.ckb.dev")
-
-# Downlink repeats. The T-Deck is half-duplex: after it TXes a request it needs
-# a few ms to retune to the 923.3 MHz downlink band and arm RX, so a single
-# immediate downlink can miss the RX window entirely. Repeating the SAME frame
-# a few times costs ~100 ms on air and makes the reply reliably land. The deck
-# matches on req_id and ignores duplicates, and we pause between requests so
-# the next uplink doesn't collide with a stale repeat.
-DL_REPEAT = int(os.environ.get("DL_REPEAT", "3"))
-DL_REPEAT_GAP = float(os.environ.get("DL_REPEAT_GAP", "0.12"))
 
 MAGIC = 0xCB
 TYPE_REQUEST = 0x02
@@ -145,18 +138,14 @@ def parse_lock_body(req_id, op, body):
 
 # ── frame helpers ─────────────────────────────────────────────────────────────
 def send_response(req_id, status, body=b""):
-    frame = bytes([MAGIC, TYPE_RESPONSE, req_id & 0xFF, status & 0xFF]) + body
-    n = max(1, DL_REPEAT)
-    for i in range(n):
-        dl = gwtx.build_downlink_frame(frame, DL_FREQ, DL_SF, DL_BW, 1, 8, DL_POWER,
-                                       int(time.time() * 1000 + i) & 0xFFFFFFFF)
-        gwtx.publish_raw(dl)
-        if i + 1 < n:
-            time.sleep(DL_REPEAT_GAP)
-    # let the concentrator finish the burst before its own next uplink RX
-    time.sleep(0.20)
+    # downlink: [CB][03][id_lo][id_hi][status][body...]   (16-bit req id)
+    frame = bytes([MAGIC, TYPE_RESPONSE, req_id & 0xFF, (req_id >> 8) & 0xFF,
+                   status & 0xFF]) + body
+    dl = gwtx.build_downlink_frame(frame, DL_FREQ, DL_SF, DL_BW, 1, 8, DL_POWER,
+                                   int(time.time()) & 0xFFFFFFFF)
+    gwtx.publish_raw(dl)
     log(f"-> resp req={req_id} status={status} body={body.hex()} "
-        f"({len(frame)}B frame x{n} downlinks)")
+        f"({len(frame)}B frame, {len(dl)}B downlink)")
 
 
 def handle(req_id, op, body):
@@ -192,9 +181,11 @@ def handle(req_id, op, body):
         log(f"CELLS req={req_id} -> {txh[:12]}..:{idx} {cap} shannons ({cap/1e8:.4f} CKB)")
         send_response(req_id, 0, bytes.fromhex(txh[2:]) + struct.pack("<I", idx) + struct.pack("<Q", cap))
 
-    elif op in (OP_SEND_REQ, OP_WITNESS):
-        log(f"op 0x{op:02x} req={req_id} not implemented yet (phase 2)")
-        send_response(req_id, 1)
+    elif op == OP_SEND_REQ:
+        P2.handle_send_req(req_id, body)
+
+    elif op == OP_WITNESS:
+        P2.handle_witness(req_id, body)
 
     else:
         log(f"unknown op 0x{op:02x} req={req_id}")
@@ -202,6 +193,14 @@ def handle(req_id, op, body):
 
 
 # ── MQTT ──────────────────────────────────────────────────────────────────────
+_client = None
+
+
+def _schedule(delay_s, fn):
+    """Run fn after delay_s without blocking the MQTT loop (thread timer)."""
+    threading.Timer(delay_s, fn).start()
+
+
 def on_connect(client, _ud, _flags, rc, _props=None):
     log(f"connected rc={rc}; subscribing {SUB_TOPIC}")
     client.subscribe(SUB_TOPIC, 0)
@@ -215,26 +214,36 @@ def on_message(_c, _ud, msg):
     if rec.get("type") != TYPE_REQUEST:
         return
     raw = bytes.fromhex(rec.get("raw", ""))
-    if len(raw) < 4:
+    if len(raw) < 5:
         return
-    req_id = raw[2]
-    op = raw[3]
-    log(f"REQ id={req_id} op=0x{op:02x} rssi={rec.get('rssi')} snr={rec.get('snr')} body={raw[4:].hex()}")
+    # uplink: [CB][02][id_lo][id_hi][op][body...]   (16-bit req id)
+    req_id = raw[2] | (raw[3] << 8)
+    op = raw[4]
+    log(f"REQ id={req_id} op=0x{op:02x} rssi={rec.get('rssi')} snr={rec.get('snr')} body={raw[5:].hex()}")
     try:
-        handle(req_id, op, raw[4:])
+        handle(req_id, op, raw[5:])
     except Exception as e:  # noqa: BLE001
         log(f"handler error: {e}")
         send_response(req_id, 3)
 
 
 def main():
+    global _client
+    _client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    P2.wire(rpc, send_response, log, _schedule)
     log(f"starting; CKB_RPC={CKB_RPC} downlink={DL_FREQ/1e6:.1f}MHz SF{DL_SF}")
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.reconnect_delay_set(1, 30)
-    client.connect(BROKER, PORT, 60)
-    client.loop_forever()
+    _client.on_connect = on_connect
+    _client.on_message = on_message
+    _client.reconnect_delay_set(1, 30)
+    _client.connect(BROKER, PORT, 60)
+    # periodically drop built-but-unsigned sends so PENDING cannot leak
+    def _sweep():
+        try:
+            P2.sweep_pending()
+        finally:
+            _schedule(15, _sweep)
+    _schedule(15, _sweep)
+    _client.loop_forever()
 
 
 if __name__ == "__main__":
